@@ -1,0 +1,8 @@
+numpy>=1.26
+PyYAML>=6.0
+pytest>=8.0
+
+# Open3D currently publishes wheels for supported CPython releases, but not
+# for every newest Python version. On Python versions without a wheel, this
+# marker lets config-generation and dependency-light tests still install.
+open3d==0.19.0; python_version >= "3.10" and python_version < "3.13"

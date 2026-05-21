@@ -1,0 +1,53 @@
+# scan_config.yaml
+# Conservative config for Revo Metro PLY point-cloud preprocessing.
+
+input: scans/raw_object.ply
+output_dir: processed
+output_name: object_cleaned
+
+scale:
+  enabled: false
+  known_axis: x        # x, y, z, or longest
+  expected_mm: 82.5
+
+crop:
+  enabled: false
+  min: [-50, -50, -10]
+  max: [50, 50, 90]
+
+cluster:
+  keep_largest: false
+  eps_mm: 1.5
+  min_points: 50
+
+outlier_removal:
+  statistical:
+    enabled: true
+    nb_neighbors: 30
+    std_ratio: 1.5
+  radius:
+    enabled: false
+    radius_mm: 1.0
+    min_neighbors: 8
+
+downsample:
+  enabled: true
+  voxel_size_mm: 0.25
+
+normals:
+  enabled: false
+  radius_mm: 1.0
+  max_nn: 30
+
+exports:
+  cleaned_ply: true
+  fusion_reference_ply: true
+  fusion_voxel_size_mm: 0.5
+  ascii: false
+
+report:
+  markdown: true
+  json: true
+
+safety:
+  allow_overwrite: false
