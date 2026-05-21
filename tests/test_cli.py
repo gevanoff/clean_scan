@@ -28,3 +28,9 @@ def test_write_sample_config_to_new_path(tmp_path: Path) -> None:
     text = config_path.read_text(encoding="utf-8")
     assert "input: scans/raw_object.ply" in text
     assert "fusion_reference_ply: true" in text
+    assert "alignment:" in text
+    assert "method: pca_frame" in text
+    assert "target_axes:" in text
+    assert "mesh:" in text
+    assert "mesh:\n  enabled: false" in text
+    assert "method: ball_pivoting" in text

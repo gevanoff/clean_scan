@@ -22,6 +22,7 @@ reports/
 scratch/
 scans/
 raw_scans/
+configs/
 *.ply
 *.pcd
 *.xyz

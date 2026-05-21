@@ -8,12 +8,13 @@ before use as reference geometry in Autodesk Fusion.
 Primary workflow:
     Revo Metro export PLY point cloud
       -> python clean_scan.py --config scan_config.yaml
-      -> cleaned PLY + optional Fusion-reference PLY + reports
-      -> Insert mesh/point reference in Fusion and rebuild CAD parametrically
+      -> cleaned PLY + optional Fusion-reference mesh/PLY + reports
+      -> Insert mesh/reference geometry in Fusion and rebuild CAD parametrically
 
 This script deliberately avoids automatic CAD reconstruction. It performs reversible,
 reported preprocessing: scale verification, crop, cluster filtering, outlier removal,
-voxel downsampling, optional normal estimation, and export.
+voxel downsampling, optional normal estimation, optional reference mesh export, and
+export.
 
 Dependencies:
     python -m pip install open3d pyyaml numpy
@@ -118,11 +119,57 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "radius_mm": 1.0,
         "max_nn": 30,
     },
+    "alignment": {
+        "enabled": False,
+        "method": "pca_frame",
+        "target_axis": "x",       # legacy pca_major_axis target: x, y, z, -x, -y, -z
+        "target_axes": {
+            "major": "x",
+            "middle": "y",
+            "minor": "z",
+        },
+        "center_at_origin": False,
+    },
     "exports": {
         "cleaned_ply": True,
         "fusion_reference_ply": True,
         "fusion_voxel_size_mm": 0.5,
         "ascii": False,
+    },
+    "mesh": {
+        "enabled": False,
+        "source": "fusion_reference",
+        "method": "ball_pivoting",
+        "export_obj": True,
+        "export_stl": True,
+        "normals": {
+            "radius_mm": 1.0,
+            "max_nn": 30,
+            "orient_consistent_tangent_plane_k": 50,
+        },
+        "ball_pivoting": {
+            "radius_multipliers": [1.5, 2.5, 4.0],
+        },
+        "poisson": {
+            "depth": 8,
+            "width": 0,
+            "scale": 1.1,
+            "linear_fit": False,
+            "density_trim_quantile": 0.02,
+        },
+        "cleanup": {
+            "remove_degenerate_triangles": True,
+            "remove_duplicated_triangles": True,
+            "remove_duplicated_vertices": True,
+            "remove_non_manifold_edges": True,
+            "simplify_enabled": True,
+            "target_triangles": 150000,
+        },
+        "validation": {
+            "min_triangles": 1000,
+            "max_triangles": 300000,
+            "warn_if_not_watertight": True,
+        },
     },
     "report": {
         "markdown": True,
@@ -163,6 +210,23 @@ class OperationReport:
 
 
 @dataclass
+class MeshReport:
+    enabled: bool
+    source: Optional[str] = None
+    method: Optional[str] = None
+    normal_estimation: Dict[str, Any] = field(default_factory=dict)
+    reconstruction: Dict[str, Any] = field(default_factory=dict)
+    cleanup: Dict[str, Any] = field(default_factory=dict)
+    validation: Dict[str, Any] = field(default_factory=dict)
+    triangle_count_before_cleanup: Optional[int] = None
+    triangle_count_after_cleanup: Optional[int] = None
+    vertex_count: Optional[int] = None
+    watertight: Optional[bool] = None
+    output_paths: Dict[str, str] = field(default_factory=dict)
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
 class ProcessingReport:
     script: str
     timestamp_utc: str
@@ -173,6 +237,7 @@ class ProcessingReport:
     operations: List[OperationReport] = field(default_factory=list)
     outputs: Dict[str, str] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
+    mesh: MeshReport = field(default_factory=lambda: MeshReport(enabled=False))
 
 
 # -----------------------------
@@ -345,6 +410,16 @@ def write_point_cloud(path: Path, pcd: o3d.geometry.PointCloud, ascii_mode: bool
     return final_path
 
 
+def write_triangle_mesh(path: Path, mesh: o3d.geometry.TriangleMesh, ascii_mode: bool, allow_overwrite: bool) -> Path:
+    require_open3d()
+    final_path = safe_write_path(path, allow_overwrite)
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    ok = o3d.io.write_triangle_mesh(str(final_path), mesh, write_ascii=ascii_mode)
+    if not ok:
+        raise RuntimeError(f"Open3D failed to write triangle mesh: {final_path}")
+    return final_path
+
+
 # -----------------------------
 # Processing operations
 # -----------------------------
@@ -481,6 +556,539 @@ def estimate_normals(pcd: o3d.geometry.PointCloud, cfg: Dict[str, Any]) -> Dict[
     return {"radius_mm": radius, "max_nn": max_nn, "note": "normals estimated but not globally reoriented"}
 
 
+def axis_vector(axis_name: Any, config_name: str) -> np.ndarray:
+    axis = str(axis_name).strip().lower()
+    axes = {
+        "x": np.array([1.0, 0.0, 0.0]),
+        "+x": np.array([1.0, 0.0, 0.0]),
+        "-x": np.array([-1.0, 0.0, 0.0]),
+        "y": np.array([0.0, 1.0, 0.0]),
+        "+y": np.array([0.0, 1.0, 0.0]),
+        "-y": np.array([0.0, -1.0, 0.0]),
+        "z": np.array([0.0, 0.0, 1.0]),
+        "+z": np.array([0.0, 0.0, 1.0]),
+        "-z": np.array([0.0, 0.0, -1.0]),
+    }
+    if axis not in axes:
+        raise ValueError(f"{config_name} must be one of: x, y, z, -x, -y, -z")
+    return axes[axis]
+
+
+def rotation_matrix_from_vectors(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    source_norm = np.linalg.norm(source)
+    target_norm = np.linalg.norm(target)
+    if source_norm <= 0 or target_norm <= 0:
+        raise ValueError("Cannot compute rotation from a zero-length vector.")
+
+    a = source / source_norm
+    b = target / target_norm
+    dot = float(np.clip(np.dot(a, b), -1.0, 1.0))
+    if dot > 1.0 - 1e-12:
+        return np.eye(3)
+    if dot < -1.0 + 1e-12:
+        helper = np.array([1.0, 0.0, 0.0])
+        if abs(float(np.dot(a, helper))) > 0.9:
+            helper = np.array([0.0, 1.0, 0.0])
+        axis = np.cross(a, helper)
+        axis = axis / np.linalg.norm(axis)
+        return -np.eye(3) + 2.0 * np.outer(axis, axis)
+
+    cross = np.cross(a, b)
+    cross_matrix = np.array(
+        [
+            [0.0, -cross[2], cross[1]],
+            [cross[2], 0.0, -cross[0]],
+            [-cross[1], cross[0], 0.0],
+        ]
+    )
+    return np.eye(3) + cross_matrix + cross_matrix @ cross_matrix * (1.0 / (1.0 + dot))
+
+
+def pca_axes(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[float]]:
+    centroid = np.mean(points, axis=0)
+    centered = points - centroid
+    covariance = centered.T @ centered / float(points.shape[0])
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    order = np.argsort(eigenvalues)[::-1]
+    eigenvalues = eigenvalues[order]
+    eigenvectors = eigenvectors[:, order]
+    if float(eigenvalues[0]) <= 0:
+        raise ValueError("PCA alignment failed: point cloud has no measurable variance.")
+
+    if float(np.linalg.det(eigenvectors)) < 0:
+        eigenvectors[:, 2] = -eigenvectors[:, 2]
+
+    total_variance = float(np.sum(np.maximum(eigenvalues, 0.0)))
+    explained = []
+    if total_variance > 0:
+        explained = (eigenvalues / total_variance).tolist()
+    return centroid, eigenvalues, eigenvectors, explained
+
+
+def default_target_axis_names(major_axis_name: Any) -> Dict[str, str]:
+    major_name = str(major_axis_name).strip().lower()
+    major = axis_vector(major_name, "alignment.target_axis")
+    candidates = [
+        ("x", np.array([1.0, 0.0, 0.0])),
+        ("y", np.array([0.0, 1.0, 0.0])),
+        ("z", np.array([0.0, 0.0, 1.0])),
+    ]
+    middle_name = "y"
+    middle = np.array([0.0, 1.0, 0.0])
+    for name, vector in candidates:
+        if abs(float(np.dot(major, vector))) < 0.5:
+            middle_name = name
+            middle = vector
+            break
+
+    minor = np.cross(major, middle)
+    minor_name = vector_axis_name(minor)
+    return {
+        "major": major_name,
+        "middle": middle_name,
+        "minor": minor_name,
+    }
+
+
+def vector_axis_name(vector: np.ndarray) -> str:
+    axes = [
+        ("x", np.array([1.0, 0.0, 0.0])),
+        ("y", np.array([0.0, 1.0, 0.0])),
+        ("z", np.array([0.0, 0.0, 1.0])),
+    ]
+    vector = vector / np.linalg.norm(vector)
+    best_name = "x"
+    best_dot = -1.0
+    best_sign = 1.0
+    for name, axis in axes:
+        dot = float(np.dot(vector, axis))
+        if abs(dot) > best_dot:
+            best_name = name
+            best_dot = abs(dot)
+            best_sign = 1.0 if dot >= 0 else -1.0
+    return best_name if best_sign > 0 else f"-{best_name}"
+
+
+def target_frame_from_config(cfg: Dict[str, Any]) -> Tuple[np.ndarray, Dict[str, str]]:
+    raw_target_axes = cfg.get("target_axes")
+    if isinstance(raw_target_axes, dict):
+        target_axis_names = {
+            "major": str(raw_target_axes.get("major", "x")).strip().lower(),
+            "middle": str(raw_target_axes.get("middle", "y")).strip().lower(),
+            "minor": str(raw_target_axes.get("minor", "z")).strip().lower(),
+        }
+    else:
+        target_axis_names = default_target_axis_names(cfg.get("target_axis", "x"))
+
+    frame = np.column_stack(
+        [
+            axis_vector(target_axis_names["major"], "alignment.target_axes.major"),
+            axis_vector(target_axis_names["middle"], "alignment.target_axes.middle"),
+            axis_vector(target_axis_names["minor"], "alignment.target_axes.minor"),
+        ]
+    )
+    if not np.allclose(frame.T @ frame, np.eye(3), atol=1e-9):
+        raise ValueError("alignment.target_axes must contain three different orthogonal axes.")
+    determinant = float(np.linalg.det(frame))
+    if determinant < 0:
+        raise ValueError("alignment.target_axes must form a right-handed frame.")
+    return frame, target_axis_names
+
+
+def choose_pca_axis_signs(source_frame: np.ndarray, target_frame: np.ndarray) -> Tuple[np.ndarray, List[float]]:
+    best_score = -float("inf")
+    best_frame = source_frame
+    best_signs = [1.0, 1.0, 1.0]
+    for first in (1.0, -1.0):
+        for second in (1.0, -1.0):
+            for third in (1.0, -1.0):
+                signs = np.array([first, second, third])
+                if np.prod(signs) < 0:
+                    continue
+                candidate = source_frame @ np.diag(signs)
+                score = float(np.trace(target_frame.T @ candidate))
+                if score > best_score:
+                    best_score = score
+                    best_frame = candidate
+                    best_signs = signs.tolist()
+    return best_frame, best_signs
+
+
+def pca_ambiguity_warnings(eigenvalues: np.ndarray) -> List[str]:
+    warnings: List[str] = []
+    if float(eigenvalues[0]) <= 0:
+        return warnings
+    major_middle_gap = float((eigenvalues[0] - eigenvalues[1]) / eigenvalues[0])
+    middle_minor_gap = float((eigenvalues[1] - eigenvalues[2]) / eigenvalues[0])
+    if major_middle_gap < 0.05:
+        warnings.append(
+            "PCA major and middle variances are close; in-plane rotation may be unstable for round or disk-like scans."
+        )
+    if middle_minor_gap < 0.05:
+        warnings.append(
+            "PCA middle and minor variances are close; roll alignment may be unstable for nearly symmetric scans."
+        )
+    return warnings
+
+
+def apply_major_axis_alignment(
+    pcd: o3d.geometry.PointCloud,
+    cfg: Dict[str, Any],
+) -> Tuple[o3d.geometry.PointCloud, Dict[str, Any]]:
+    method = str(cfg.get("method", "pca_major_axis")).lower()
+    if method not in {"pca_major_axis", "pca_frame"}:
+        raise ValueError("alignment.method must be one of: pca_major_axis, pca_frame")
+    if point_count(pcd) < 3:
+        raise ValueError("PCA alignment requires at least 3 points.")
+
+    points = np.asarray(pcd.points, dtype=float)
+    centroid, eigenvalues, eigenvectors, explained = pca_axes(points)
+    source_frame = eigenvectors
+    target_axis_names: Dict[str, str]
+    source_signs: List[float]
+
+    if method == "pca_major_axis":
+        major_axis = np.asarray(source_frame[:, 0], dtype=float)
+        target_axis_name = str(cfg.get("target_axis", "x")).strip().lower()
+        target = axis_vector(target_axis_name, "alignment.target_axis")
+        if float(np.dot(major_axis, target)) < 0:
+            major_axis = -major_axis
+        rotation = rotation_matrix_from_vectors(major_axis, target)
+        target_axis_names = {"major": target_axis_name}
+        source_signs = [1.0, 1.0, 1.0]
+    else:
+        target_frame, target_axis_names = target_frame_from_config(cfg)
+        source_frame, source_signs = choose_pca_axis_signs(source_frame, target_frame)
+        rotation = target_frame @ source_frame.T
+
+    aligned = copy.deepcopy(pcd)
+    aligned.rotate(rotation, center=centroid)
+
+    translation = [0.0, 0.0, 0.0]
+    center_at_origin = bool(cfg.get("center_at_origin", False))
+    if center_at_origin:
+        translation_vector = -np.asarray(aligned.get_center(), dtype=float)
+        aligned.translate(translation_vector)
+        translation = translation_vector.tolist()
+
+    return aligned, {
+        "method": method,
+        "target_axis": target_axis_names.get("major"),
+        "target_axes": target_axis_names,
+        "center_at_origin": center_at_origin,
+        "centroid_before": centroid.tolist(),
+        "principal_axes_before": eigenvectors.T.tolist(),
+        "principal_variances": eigenvalues.tolist(),
+        "explained_variance_ratio": explained,
+        "source_axis_signs": source_signs,
+        "rotation_matrix": rotation.tolist(),
+        "translation_after_rotation": translation,
+        "warnings": pca_ambiguity_warnings(eigenvalues),
+    }
+
+
+def triangle_count(mesh: o3d.geometry.TriangleMesh) -> int:
+    return int(np.asarray(mesh.triangles).shape[0])
+
+
+def vertex_count(mesh: o3d.geometry.TriangleMesh) -> int:
+    return int(np.asarray(mesh.vertices).shape[0])
+
+
+def estimate_nearest_neighbor_spacing(pcd: o3d.geometry.PointCloud) -> Optional[float]:
+    if point_count(pcd) < 2:
+        return None
+    distances = np.asarray(pcd.compute_nearest_neighbor_distance(), dtype=float)
+    distances = distances[np.isfinite(distances) & (distances > 0)]
+    if distances.size == 0:
+        return None
+    return float(np.median(distances))
+
+
+def estimate_mesh_normals(
+    pcd: o3d.geometry.PointCloud,
+    cfg: Dict[str, Any],
+    warnings: List[str],
+) -> Dict[str, Any]:
+    require_open3d()
+    radius = require_positive(cfg.get("radius_mm", 1.0), "mesh.normals.radius_mm")
+    max_nn = int(require_positive(cfg.get("max_nn", 30), "mesh.normals.max_nn"))
+    orient_k = int(require_number(
+        cfg.get("orient_consistent_tangent_plane_k", 50),
+        "mesh.normals.orient_consistent_tangent_plane_k",
+    ))
+    if orient_k < 0:
+        raise ValueError("mesh.normals.orient_consistent_tangent_plane_k must be >= 0")
+
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=max_nn)
+    )
+
+    oriented = False
+    if orient_k > 0:
+        if point_count(pcd) <= orient_k:
+            warnings.append(
+                "Skipped consistent normal orientation because the source cloud has "
+                f"{point_count(pcd)} points and k={orient_k}."
+            )
+        else:
+            try:
+                pcd.orient_normals_consistent_tangent_plane(orient_k)
+                oriented = True
+            except RuntimeError as exc:
+                warnings.append(f"Could not consistently orient mesh normals: {exc}")
+
+    return {
+        "radius_mm": radius,
+        "max_nn": max_nn,
+        "orient_consistent_tangent_plane_k": orient_k,
+        "oriented_consistently": oriented,
+    }
+
+
+def build_ball_pivoting_mesh(
+    pcd: o3d.geometry.PointCloud,
+    cfg: Dict[str, Any],
+) -> Tuple[o3d.geometry.TriangleMesh, Dict[str, Any]]:
+    require_open3d()
+    spacing = estimate_nearest_neighbor_spacing(pcd)
+    if spacing is None or spacing <= 0:
+        raise ValueError("Cannot run Ball Pivoting: failed to estimate point spacing from the mesh source.")
+
+    raw_multipliers = cfg.get("radius_multipliers", [1.5, 2.5, 4.0])
+    if not isinstance(raw_multipliers, list) or not raw_multipliers:
+        raise ValueError("mesh.ball_pivoting.radius_multipliers must be a non-empty list of positive numbers.")
+    multipliers = [require_positive(value, "mesh.ball_pivoting.radius_multipliers[]") for value in raw_multipliers]
+    radii = [spacing * multiplier for multiplier in multipliers]
+
+    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+        pcd,
+        o3d.utility.DoubleVector(radii),
+    )
+    return mesh, {
+        "estimated_spacing_mm": spacing,
+        "radius_multipliers": multipliers,
+        "pivot_radii_mm": radii,
+    }
+
+
+def build_poisson_mesh(
+    pcd: o3d.geometry.PointCloud,
+    cfg: Dict[str, Any],
+) -> Tuple[o3d.geometry.TriangleMesh, Dict[str, Any]]:
+    require_open3d()
+    depth = int(require_positive(cfg.get("depth", 8), "mesh.poisson.depth"))
+    width = int(require_number(cfg.get("width", 0), "mesh.poisson.width"))
+    scale = require_positive(cfg.get("scale", 1.1), "mesh.poisson.scale")
+    linear_fit = bool(cfg.get("linear_fit", False))
+    density_trim_quantile = require_number(
+        cfg.get("density_trim_quantile", 0.02),
+        "mesh.poisson.density_trim_quantile",
+    )
+    if width < 0:
+        raise ValueError("mesh.poisson.width must be >= 0")
+    if not 0.0 <= density_trim_quantile < 1.0:
+        raise ValueError("mesh.poisson.density_trim_quantile must be >= 0 and < 1")
+
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd,
+        depth=depth,
+        width=width,
+        scale=scale,
+        linear_fit=linear_fit,
+    )
+    densities_array = np.asarray(densities, dtype=float)
+    trim_threshold: Optional[float] = None
+    removed_by_density = 0
+    if densities_array.size > 0 and density_trim_quantile > 0:
+        trim_threshold = float(np.quantile(densities_array, density_trim_quantile))
+        remove_mask = densities_array < trim_threshold
+        removed_by_density = int(np.sum(remove_mask))
+        mesh.remove_vertices_by_mask(remove_mask.tolist())
+
+    source_bbox = pcd.get_axis_aligned_bounding_box()
+    spacing = estimate_nearest_neighbor_spacing(pcd)
+    extent = np.asarray(source_bbox.get_extent(), dtype=float)
+    margin = spacing if spacing is not None else float(np.max(extent)) * 0.005
+    margin = max(float(margin), 1e-6)
+    crop_bbox = o3d.geometry.AxisAlignedBoundingBox(
+        min_bound=np.asarray(source_bbox.get_min_bound(), dtype=float) - margin,
+        max_bound=np.asarray(source_bbox.get_max_bound(), dtype=float) + margin,
+    )
+    mesh = mesh.crop(crop_bbox)
+
+    return mesh, {
+        "depth": depth,
+        "width": width,
+        "scale": scale,
+        "linear_fit": linear_fit,
+        "density_trim_quantile": density_trim_quantile,
+        "density_trim_threshold": trim_threshold,
+        "vertices_removed_by_density_trim": removed_by_density,
+        "crop_margin_mm": margin,
+    }
+
+
+def cleanup_mesh(mesh: o3d.geometry.TriangleMesh, cfg: Dict[str, Any]) -> Tuple[o3d.geometry.TriangleMesh, Dict[str, Any]]:
+    cleaned = copy.deepcopy(mesh)
+    details: Dict[str, Any] = {
+        "triangles_before_cleanup": triangle_count(cleaned),
+        "vertices_before_cleanup": vertex_count(cleaned),
+        "steps": [],
+    }
+
+    if cfg.get("remove_degenerate_triangles", True):
+        cleaned.remove_degenerate_triangles()
+        details["steps"].append("remove_degenerate_triangles")
+    if cfg.get("remove_duplicated_triangles", True):
+        cleaned.remove_duplicated_triangles()
+        details["steps"].append("remove_duplicated_triangles")
+    if cfg.get("remove_duplicated_vertices", True):
+        cleaned.remove_duplicated_vertices()
+        details["steps"].append("remove_duplicated_vertices")
+    if cfg.get("remove_non_manifold_edges", True):
+        if hasattr(cleaned, "remove_non_manifold_edges"):
+            cleaned.remove_non_manifold_edges()
+            details["steps"].append("remove_non_manifold_edges")
+        else:
+            details["remove_non_manifold_edges"] = "not supported by this Open3D version"
+
+    details["triangles_after_basic_cleanup"] = triangle_count(cleaned)
+    details["vertices_after_basic_cleanup"] = vertex_count(cleaned)
+
+    target_triangles = int(require_positive(cfg.get("target_triangles", 150000), "mesh.cleanup.target_triangles"))
+    simplify_enabled = bool(cfg.get("simplify_enabled", True))
+    details["simplify_enabled"] = simplify_enabled
+    details["target_triangles"] = target_triangles
+    details["simplified"] = False
+    if simplify_enabled and triangle_count(cleaned) > target_triangles:
+        cleaned = cleaned.simplify_quadric_decimation(target_number_of_triangles=target_triangles)
+        cleaned.remove_degenerate_triangles()
+        cleaned.remove_duplicated_triangles()
+        cleaned.remove_duplicated_vertices()
+        details["simplified"] = True
+        details["steps"].append("simplify_quadric_decimation")
+
+    details["triangles_after_cleanup"] = triangle_count(cleaned)
+    details["vertices_after_cleanup"] = vertex_count(cleaned)
+    return cleaned, details
+
+
+def mesh_watertight_status(mesh: o3d.geometry.TriangleMesh) -> Optional[bool]:
+    if not hasattr(mesh, "is_watertight"):
+        return None
+    try:
+        return bool(mesh.is_watertight())
+    except RuntimeError:
+        return None
+
+
+def reconstruct_and_export_mesh(
+    source_pcd: o3d.geometry.PointCloud,
+    source_label: str,
+    cfg: Dict[str, Any],
+    output_dir: Path,
+    output_name: str,
+    ascii_mode: bool,
+    allow_overwrite: bool,
+) -> MeshReport:
+    require_open3d()
+    method = str(cfg.get("method", "ball_pivoting")).lower()
+    if method not in {"ball_pivoting", "poisson"}:
+        raise ValueError("mesh.method must be one of: ball_pivoting, poisson")
+    if point_count(source_pcd) < 4:
+        raise ValueError("Mesh reconstruction requires at least 4 source points.")
+
+    warnings = [
+        "Mesh export is for Fusion reference only.",
+        "Verify against the cleaned PLY and physical measurements.",
+        "Poisson may invent surfaces or cap holes.",
+        "Ball Pivoting may leave holes if scan density is uneven.",
+    ]
+    mesh_source = copy.deepcopy(source_pcd)
+    normal_details = estimate_mesh_normals(mesh_source, cfg.get("normals", {}), warnings)
+
+    if method == "ball_pivoting":
+        raw_mesh, reconstruction_details = build_ball_pivoting_mesh(
+            mesh_source,
+            cfg.get("ball_pivoting", {}),
+        )
+    else:
+        raw_mesh, reconstruction_details = build_poisson_mesh(
+            mesh_source,
+            cfg.get("poisson", {}),
+        )
+
+    before_cleanup = triangle_count(raw_mesh)
+    if before_cleanup == 0:
+        raise ValueError(
+            f"Mesh reconstruction produced 0 triangles using {method}; "
+            "try a denser source cloud, different normal radius, or a different mesh method."
+        )
+
+    cleaned_mesh, cleanup_details = cleanup_mesh(raw_mesh, cfg.get("cleanup", {}))
+    after_cleanup = triangle_count(cleaned_mesh)
+    vertices = vertex_count(cleaned_mesh)
+    validation_cfg = cfg.get("validation", {})
+    min_triangles = int(require_positive(validation_cfg.get("min_triangles", 1000), "mesh.validation.min_triangles"))
+    max_triangles = int(require_positive(validation_cfg.get("max_triangles", 300000), "mesh.validation.max_triangles"))
+    if max_triangles < min_triangles:
+        raise ValueError("mesh.validation.max_triangles must be greater than or equal to min_triangles")
+    if after_cleanup < min_triangles:
+        raise ValueError(
+            f"Mesh reconstruction produced only {after_cleanup} triangles after cleanup; "
+            f"minimum useful mesh threshold is {min_triangles}."
+        )
+    if after_cleanup > max_triangles:
+        raise ValueError(
+            f"Mesh reconstruction produced {after_cleanup} triangles after cleanup; "
+            f"maximum configured threshold is {max_triangles}. Enable simplification or raise the limit."
+        )
+    if vertices == 0:
+        raise ValueError("Mesh cleanup removed all vertices.")
+
+    cleaned_mesh.compute_vertex_normals()
+    watertight = mesh_watertight_status(cleaned_mesh)
+    warn_if_not_watertight = bool(validation_cfg.get("warn_if_not_watertight", True))
+    if warn_if_not_watertight and watertight is False:
+        warnings.append("Mesh is not watertight; use it as reference geometry, not final CAD.")
+
+    output_paths: Dict[str, str] = {}
+    if cfg.get("export_obj", True):
+        obj_path = output_dir / f"{output_name}_fusion_ref.obj"
+        written = write_triangle_mesh(obj_path, cleaned_mesh, ascii_mode=True, allow_overwrite=allow_overwrite)
+        output_paths["fusion_reference_obj"] = str(written)
+    if cfg.get("export_stl", True):
+        stl_path = output_dir / f"{output_name}_fusion_ref.stl"
+        if ascii_mode:
+            warnings.append("Open3D does not support ASCII STL export; wrote binary STL instead.")
+        written = write_triangle_mesh(stl_path, cleaned_mesh, ascii_mode=False, allow_overwrite=allow_overwrite)
+        output_paths["fusion_reference_stl"] = str(written)
+    if not output_paths:
+        warnings.append("Mesh reconstruction ran, but OBJ and STL export are both disabled.")
+
+    validation_details = {
+        "min_triangles": min_triangles,
+        "max_triangles": max_triangles,
+        "warn_if_not_watertight": warn_if_not_watertight,
+    }
+    return MeshReport(
+        enabled=True,
+        source=source_label,
+        method=method,
+        normal_estimation=normal_details,
+        reconstruction=reconstruction_details,
+        cleanup=cleanup_details,
+        validation=validation_details,
+        triangle_count_before_cleanup=before_cleanup,
+        triangle_count_after_cleanup=after_cleanup,
+        vertex_count=vertices,
+        watertight=watertight,
+        output_paths=output_paths,
+        warnings=warnings,
+    )
+
+
 def record_operation(
     report: ProcessingReport,
     name: str,
@@ -546,6 +1154,38 @@ def write_markdown_report(path: Path, report: ProcessingReport, allow_overwrite:
             f"| {op.name} | {op.enabled} | {op.before_points:,} | {op.after_points:,} "
             f"| {op.removed_points:,} | `{details}` |"
         )
+    lines.append("")
+
+    lines.append("## Mesh")
+    lines.append("")
+    mesh = report.mesh
+    lines.append(f"- Enabled: `{mesh.enabled}`")
+    if mesh.enabled:
+        lines.append(f"- Source: `{mesh.source}`")
+        lines.append(f"- Method: `{mesh.method}`")
+        lines.append(f"- Triangle count before cleanup: `{mesh.triangle_count_before_cleanup}`")
+        lines.append(f"- Triangle count after cleanup: `{mesh.triangle_count_after_cleanup}`")
+        lines.append(f"- Vertex count: `{mesh.vertex_count}`")
+        lines.append(f"- Watertight: `{mesh.watertight}`")
+        lines.append("")
+        lines.append("### Mesh Details")
+        lines.append("")
+        lines.append(f"- Normal estimation: `{json.dumps(mesh.normal_estimation, ensure_ascii=False)}`")
+        lines.append(f"- Reconstruction: `{json.dumps(mesh.reconstruction, ensure_ascii=False)}`")
+        lines.append(f"- Cleanup: `{json.dumps(mesh.cleanup, ensure_ascii=False)}`")
+        lines.append(f"- Validation: `{json.dumps(mesh.validation, ensure_ascii=False)}`")
+        if mesh.output_paths:
+            lines.append("")
+            lines.append("### Mesh Outputs")
+            lines.append("")
+            for key, value in mesh.output_paths.items():
+                lines.append(f"- {key}: `{value}`")
+        if mesh.warnings:
+            lines.append("")
+            lines.append("### Mesh Warnings")
+            lines.append("")
+            for warning in mesh.warnings:
+                lines.append(f"- {warning}")
     lines.append("")
 
     if report.outputs:
@@ -691,12 +1331,30 @@ def process(config: Dict[str, Any]) -> ProcessingReport:
     else:
         record_operation(report, "estimate_normals", False, before, before, {})
 
+    # Optional rigid alignment for downstream reference use.
+    before = point_count(pcd)
+    alignment_cfg = config.get("alignment", {})
+    if alignment_cfg.get("enabled"):
+        pcd, details = apply_major_axis_alignment(pcd, alignment_cfg)
+        after = point_count(pcd)
+        record_operation(report, "major_axis_alignment", True, before, after, details)
+        for warning in details.get("warnings", []):
+            report.warnings.append(f"PCA alignment: {warning}")
+        report.stats.append(compute_stats(pcd, "after_major_axis_alignment"))
+    else:
+        record_operation(report, "major_axis_alignment", False, before, before, {})
+
     final_stats = compute_stats(pcd, "final_cleaned")
     report.stats.append(final_stats)
     print_stats(final_stats)
 
     # Exports
     exports = config.get("exports", {})
+    mesh_cfg = config.get("mesh", {})
+    mesh_enabled = bool(mesh_cfg.get("enabled", False))
+    mesh_source = str(mesh_cfg.get("source", "fusion_reference")).lower()
+    if mesh_enabled and mesh_source not in {"fusion_reference", "cleaned"}:
+        raise ValueError("mesh.source must be one of: fusion_reference, cleaned")
 
     if exports.get("cleaned_ply", True):
         cleaned_path = output_dir / f"{output_name}_cleaned.ply"
@@ -704,17 +1362,51 @@ def process(config: Dict[str, Any]) -> ProcessingReport:
         report.outputs["cleaned_ply"] = str(written)
         print(f"Wrote cleaned PLY: {written}")
 
-    if exports.get("fusion_reference_ply", True):
+    fusion_pcd: Optional[o3d.geometry.PointCloud] = None
+    needs_fusion_reference = bool(exports.get("fusion_reference_ply", True)) or (
+        mesh_enabled and mesh_source == "fusion_reference"
+    )
+    if needs_fusion_reference:
         fusion_voxel = require_positive(exports.get("fusion_voxel_size_mm", 0.5), "exports.fusion_voxel_size_mm")
         before = point_count(pcd)
         fusion_pcd, details = apply_voxel_downsample(pcd, fusion_voxel)
         after = point_count(fusion_pcd)
         record_operation(report, "fusion_reference_downsample", True, before, after, details)
-        fusion_path = output_dir / f"{output_name}_fusion_ref.ply"
-        written = write_point_cloud(fusion_path, fusion_pcd, ascii_mode, allow_overwrite)
-        report.outputs["fusion_reference_ply"] = str(written)
+        if after == 0:
+            raise ValueError("Fusion-reference downsampling removed all points. Use a smaller fusion_voxel_size_mm.")
         report.stats.append(compute_stats(fusion_pcd, "fusion_reference"))
-        print(f"Wrote Fusion reference PLY: {written}")
+        if exports.get("fusion_reference_ply", True):
+            fusion_path = output_dir / f"{output_name}_fusion_ref.ply"
+            written = write_point_cloud(fusion_path, fusion_pcd, ascii_mode, allow_overwrite)
+            report.outputs["fusion_reference_ply"] = str(written)
+            print(f"Wrote Fusion reference PLY: {written}")
+
+    if mesh_enabled:
+        if mesh_source == "fusion_reference":
+            if fusion_pcd is None:
+                raise RuntimeError("Internal error: fusion reference source was not prepared for mesh export.")
+            source_pcd = fusion_pcd
+        else:
+            source_pcd = pcd
+
+        report.mesh = reconstruct_and_export_mesh(
+            source_pcd=source_pcd,
+            source_label=mesh_source,
+            cfg=mesh_cfg,
+            output_dir=output_dir,
+            output_name=output_name,
+            ascii_mode=ascii_mode,
+            allow_overwrite=allow_overwrite,
+        )
+        report.outputs.update(report.mesh.output_paths)
+        report.warnings.extend(report.mesh.warnings)
+        print(
+            "Mesh export: "
+            f"{report.mesh.triangle_count_before_cleanup:,} -> "
+            f"{report.mesh.triangle_count_after_cleanup:,} triangles"
+        )
+        for key, value in report.mesh.output_paths.items():
+            print(f"Wrote {key}: {value}")
 
     # Reports
     report_base = output_dir / f"{output_name}_report"
@@ -784,11 +1476,56 @@ normals:
   radius_mm: 1.0
   max_nn: 30
 
+alignment:
+  enabled: false
+  method: pca_frame     # pca_frame or pca_major_axis
+  target_axis: x        # legacy pca_major_axis target: x, y, z, -x, -y, or -z
+  target_axes:
+    major: x            # Longest PCA axis.
+    middle: y           # Second PCA axis, useful for T arms and disk in-plane roll.
+    minor: z            # Shortest PCA axis, useful as disk/plate normal.
+  center_at_origin: false
+
 exports:
   cleaned_ply: true
   fusion_reference_ply: true
   fusion_voxel_size_mm: 0.5
   ascii: false
+
+mesh:
+  enabled: false
+  source: fusion_reference        # fusion_reference or cleaned
+  method: ball_pivoting           # ball_pivoting or poisson
+  export_obj: true
+  export_stl: true
+
+  normals:
+    radius_mm: 1.0
+    max_nn: 30
+    orient_consistent_tangent_plane_k: 50
+
+  ball_pivoting:
+    radius_multipliers: [1.5, 2.5, 4.0]
+
+  poisson:
+    depth: 8
+    width: 0
+    scale: 1.1
+    linear_fit: false
+    density_trim_quantile: 0.02
+
+  cleanup:
+    remove_degenerate_triangles: true
+    remove_duplicated_triangles: true
+    remove_duplicated_vertices: true
+    remove_non_manifold_edges: true
+    simplify_enabled: true
+    target_triangles: 150000
+
+  validation:
+    min_triangles: 1000
+    max_triangles: 300000
+    warn_if_not_watertight: true
 
 report:
   markdown: true

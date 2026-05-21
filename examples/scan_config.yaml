@@ -39,11 +39,56 @@ normals:
   radius_mm: 1.0
   max_nn: 30
 
+alignment:
+  enabled: false
+  method: pca_frame     # pca_frame or pca_major_axis
+  target_axis: x        # legacy pca_major_axis target: x, y, z, -x, -y, or -z
+  target_axes:
+    major: x            # Longest PCA axis.
+    middle: y           # Second PCA axis, useful for T arms and disk in-plane roll.
+    minor: z            # Shortest PCA axis, useful as disk/plate normal.
+  center_at_origin: false
+
 exports:
   cleaned_ply: true
   fusion_reference_ply: true
   fusion_voxel_size_mm: 0.5
   ascii: false
+
+mesh:
+  enabled: false
+  source: fusion_reference        # fusion_reference or cleaned
+  method: ball_pivoting           # ball_pivoting or poisson
+  export_obj: true
+  export_stl: true
+
+  normals:
+    radius_mm: 1.0
+    max_nn: 30
+    orient_consistent_tangent_plane_k: 50
+
+  ball_pivoting:
+    radius_multipliers: [1.5, 2.5, 4.0]
+
+  poisson:
+    depth: 8
+    width: 0
+    scale: 1.1
+    linear_fit: false
+    density_trim_quantile: 0.02
+
+  cleanup:
+    remove_degenerate_triangles: true
+    remove_duplicated_triangles: true
+    remove_duplicated_vertices: true
+    remove_non_manifold_edges: true
+    simplify_enabled: true
+    target_triangles: 150000
+
+  validation:
+    min_triangles: 1000
+    max_triangles: 300000
+    warn_if_not_watertight: true
 
 report:
   markdown: true
